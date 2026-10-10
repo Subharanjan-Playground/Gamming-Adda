@@ -1,0 +1,308 @@
+import os
+from datetime import datetime
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
+# ---------------------------------------------------------
+# DATABASE CONFIGURATION (SQLite local -> PostgreSQL cloud)
+# ---------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./gaming_cafe.db")
+
+# SQLite requires 'check_same_thread: False' for multi-threaded FastAPI calls
+engine_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, connect_args=engine_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# ---------------------------------------------------------
+# SQLALCHEMY DATABASE TABLES
+# ---------------------------------------------------------
+class StationModel(Base):
+    __tablename__ = "stations"
+    id = Column(String, primary_key=True, index=True)
+    branch_id = Column(String, index=True)  # "shop_a" or "shop_b"
+    name = Column(String)
+    station_type = Column(String)           # "pc" or "ps"
+    price_per_hour = Column(Float)          # 60.0 or 80.0
+    status = Column(String, default="available")  # "available", "occupied", "maintenance"
+    active_game = Column(String, nullable=True)
+
+class GameModel(Base):
+    __tablename__ = "games"
+    id = Column(String, primary_key=True, index=True)
+    title = Column(String)
+    platform = Column(String, index=True)   # "PC" or "PS5"
+    genre = Column(String)
+    badge = Column(String, nullable=True)   # "HOT", "NEW", "TOP"
+
+class MenuItemModel(Base):
+    __tablename__ = "menu_items"
+    id = Column(String, primary_key=True, index=True)
+    branch_id = Column(String, index=True)
+    name = Column(String)
+    category = Column(String)               # "snack", "drink", "meal"
+    price = Column(Float)
+    in_stock = Column(Boolean, default=True)
+
+class SessionBookingModel(Base):
+    __tablename__ = "bookings"
+    id = Column(String, primary_key=True, index=True)
+    branch_id = Column(String)
+    station_id = Column(String)
+    game_title = Column(String)
+    customer_name = Column(String)
+    customer_phone = Column(String)
+    duration_minutes = Column(Integer)
+    total_amount = Column(Float)
+    status = Column(String, default="active")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class OrderModel(Base):
+    __tablename__ = "orders"
+    id = Column(String, primary_key=True, index=True)
+    branch_id = Column(String)
+    station_id = Column(String)
+    items_summary = Column(String)          # e.g. "Red Bull (x2), Maggi (x1)"
+    total_amount = Column(Float)
+    status = Column(String, default="pending")  # "pending", "preparing", "delivered"
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+Base.metadata.create_all(bind=engine)
+
+# ---------------------------------------------------------
+# DATABASE SEEDER (Runs automatically if DB is empty)
+# ---------------------------------------------------------
+def seed_database():
+    db = SessionLocal()
+    try:
+        # Seed Stations
+        if db.query(StationModel).count() == 0:
+            default_stations = [
+                # Shop A
+                StationModel(id="A-PC-01", branch_id="shop_a", name="RTX 4080 Rig 1", station_type="pc", price_per_hour=60.0),
+                StationModel(id="A-PC-02", branch_id="shop_a", name="RTX 4080 Rig 2", station_type="pc", price_per_hour=60.0),
+                StationModel(id="A-PC-03", branch_id="shop_a", name="RTX 4080 Rig 3", station_type="pc", price_per_hour=60.0),
+                StationModel(id="A-PS-01", branch_id="shop_a", name="PS5 VIP Console 1", station_type="ps", price_per_hour=80.0),
+                StationModel(id="A-PS-02", branch_id="shop_a", name="PS5 VIP Console 2", station_type="ps", price_per_hour=80.0),
+                # Shop B
+                StationModel(id="B-PC-01", branch_id="shop_b", name="RTX 4090 Arena 1", station_type="pc", price_per_hour=60.0),
+                StationModel(id="B-PC-02", branch_id="shop_b", name="RTX 4090 Arena 2", station_type="pc", price_per_hour=60.0),
+                StationModel(id="B-PS-01", branch_id="shop_b", name="PS5 Pro OLED 1", station_type="ps", price_per_hour=80.0),
+                StationModel(id="B-PS-02", branch_id="shop_b", name="PS5 Pro OLED 2", station_type="ps", price_per_hour=80.0),
+            ]
+            db.add_all(default_stations)
+
+        # Seed Games Catalog
+        if db.query(GameModel).count() == 0:
+            default_games = [
+                # PS5
+                GameModel(id="ps-1", title="EA Sports FC 26", platform="PS5", genre="Sports", badge="HOT"),
+                GameModel(id="ps-2", title="GTA V", platform="PS5", genre="Open World", badge="POPULAR"),
+                GameModel(id="ps-3", title="Call of Duty: Black Ops 6", platform="PS5", genre="FPS", badge="HOT"),
+                GameModel(id="ps-4", title="God of War Ragnarök", platform="PS5", genre="Adventure", badge="STORY"),
+                GameModel(id="ps-5", title="Spider-Man 2", platform="PS5", genre="Action", badge="POPULAR"),
+                GameModel(id="ps-6", title="Tekken 8", platform="PS5", genre="Fighting", badge="TOP"),
+                GameModel(id="ps-7", title="WWE 2K26", platform="PS5", genre="Sports", badge="NEW"),
+                GameModel(id="ps-8", title="Gran Turismo 7", platform="PS5", genre="Racing", badge=None),
+                # PC
+                GameModel(id="pc-1", title="Counter-Strike 2", platform="PC", genre="Tactical FPS", badge="HOT"),
+                GameModel(id="pc-2", title="Valorant", platform="PC", genre="Tactical Shooter", badge="TOP"),
+                GameModel(id="pc-3", title="GTA V", platform="PC", genre="Open World", badge="POPULAR"),
+                GameModel(id="pc-4", title="Call of Duty: Warzone", platform="PC", genre="FPS", badge="HOT"),
+                GameModel(id="pc-5", title="EA Sports FC 26", platform="PC", genre="Sports", badge="NEW"),
+                GameModel(id="pc-6", title="Dota 2", platform="PC", genre="MOBA", badge=None),
+                GameModel(id="pc-7", title="Forza Horizon 5", platform="PC", genre="Racing", badge="HOT"),
+                GameModel(id="pc-8", title="Red Dead Redemption 2", platform="PC", genre="Open World", badge="STORY"),
+            ]
+            db.add_all(default_games)
+
+        # Seed Menu Items for both branches
+        if db.query(MenuItemModel).count() == 0:
+            menu_items = []
+            for b in ["shop_a", "shop_b"]:
+                menu_items.extend([
+                    MenuItemModel(id=f"{b}-f-1", branch_id=b, name="Red Bull (250ml)", category="drink", price=125.0, in_stock=True),
+                    MenuItemModel(id=f"{b}-f-2", branch_id=b, name="Monster Energy (350ml)", category="drink", price=120.0, in_stock=True),
+                    MenuItemModel(id=f"{b}-f-3", branch_id=b, name="Cold Coffee Frappe", category="drink", price=90.0, in_stock=True),
+                    MenuItemModel(id=f"{b}-f-4", branch_id=b, name="Coca Cola Can (300ml)", category="drink", price=40.0, in_stock=True),
+                    MenuItemModel(id=f"{b}-f-5", branch_id=b, name="Peri Peri French Fries", category="snack", price=99.0, in_stock=True),
+                    MenuItemModel(id=f"{b}-f-6", branch_id=b, name="Cheese Maggi (Double)", category="meal", price=85.0, in_stock=True),
+                    MenuItemModel(id=f"{b}-f-7", branch_id=b, name="Chicken Nuggets (6 Pcs)", category="snack", price=149.0, in_stock=True),
+                ])
+            db.add_all(menu_items)
+
+        db.commit()
+    finally:
+        db.close()
+
+seed_database()
+
+# ---------------------------------------------------------
+# FASTAPI APP & ENDPOINTS
+# ---------------------------------------------------------
+app = FastAPI(title="Gaming Adda")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# PYDANTIC SCHEMAS
+class BookingRequest(BaseModel):
+    station_id: str
+    game_title: str
+    customer_name: str
+    customer_phone: str
+    duration_minutes: int
+
+class StockToggleRequest(BaseModel):
+    item_id: str
+    in_stock: bool
+    pin: str
+
+class AddGameRequest(BaseModel):
+    title: str
+    platform: str
+    genre: str
+    badge: Optional[str] = "NEW"
+    pin: str
+
+# ROUTES
+@app.get("/api/stations")
+def get_stations(branch_id: str = "shop_a", db: Session = Depends(get_db)):
+    return db.query(StationModel).filter(StationModel.branch_id == branch_id).all()
+
+@app.get("/api/games")
+def get_games(platform: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(GameModel)
+    if platform:
+        query = query.filter(GameModel.platform == platform.upper())
+    return query.all()
+
+@app.post("/api/games")
+def add_new_game(req: AddGameRequest, db: Session = Depends(get_db)):
+    if req.pin != "9900":
+        raise HTTPException(status_code=403, detail="Invalid admin PIN")
+    
+    new_game = GameModel(
+        id=f"{req.platform.lower()}-{int(datetime.utcnow().timestamp())}",
+        title=req.title.strip(),
+        platform=req.platform.upper(),
+        genre=req.genre.strip(),
+        badge=req.badge or "NEW"
+    )
+    db.add(new_game)
+    db.commit()
+    db.refresh(new_game)
+    return new_game
+
+@app.get("/api/menu")
+def get_menu(branch_id: str = "shop_a", db: Session = Depends(get_db)):
+    return db.query(MenuItemModel).filter(MenuItemModel.branch_id == branch_id).all()
+
+@app.post("/api/menu/stock-toggle")
+def toggle_stock(req: StockToggleRequest, db: Session = Depends(get_db)):
+    if req.pin != "9900":
+        raise HTTPException(status_code=403, detail="Invalid admin PIN")
+    
+    item = db.query(MenuItemModel).filter(MenuItemModel.id == req.item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    
+    item.in_stock = req.in_stock
+    db.commit()
+    return {"message": "Stock status updated", "item_id": item.id, "in_stock": item.in_stock}
+
+@app.post("/api/bookings")
+def create_booking(req: BookingRequest, db: Session = Depends(get_db)):
+    station = db.query(StationModel).filter(StationModel.id == req.station_id).first()
+    if not station:
+        raise HTTPException(status_code=404, detail="Station not found")
+    if station.status != "available":
+        raise HTTPException(status_code=400, detail="Station is already occupied")
+
+    hours = req.duration_minutes / 60.0
+    total_bill = station.price_per_hour * hours
+
+    booking = SessionBookingModel(
+        id=f"BK-{int(datetime.utcnow().timestamp())}",
+        branch_id=station.branch_id,
+        station_id=station.id,
+        game_title=req.game_title,
+        customer_name=req.customer_name,
+        customer_phone=req.customer_phone,
+        duration_minutes=req.duration_minutes,
+        total_amount=total_bill,
+        status="active"
+    )
+    station.status = "occupied"
+    station.active_game = req.game_title
+
+    db.add(booking)
+    db.commit()
+    db.refresh(booking)
+    return {"message": "Booking successful", "booking": booking}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    # ---------------------------------------------------------
+# F&B ORDERS & STATION RELEASE ENDPOINTS
+# ---------------------------------------------------------
+class CreateOrderRequest(BaseModel):
+    branch_id: str
+    station_id: str
+    items_summary: str
+    total_amount: float
+
+class ReleaseStationRequest(BaseModel):
+    station_id: str
+    pin: str
+
+@app.get("/api/orders")
+def get_orders(branch_id: str = "shop_a", db: Session = Depends(get_db)):
+    """Counter staff view: retrieve all pending food & drink orders for a branch"""
+    return db.query(OrderModel).filter(OrderModel.branch_id == branch_id).order_by(OrderModel.created_at.desc()).all()
+
+@app.post("/api/orders")
+def create_order(req: CreateOrderRequest, db: Session = Depends(get_db)):
+    """Customer in-seat order: delivers directly to their gaming station"""
+    new_order = OrderModel(
+        id=f"ORD-{int(datetime.utcnow().timestamp())}",
+        branch_id=req.branch_id,
+        station_id=req.station_id,
+        items_summary=req.items_summary,
+        total_amount=req.total_amount,
+        status="pending"
+    )
+    db.add(new_order)
+    db.commit()
+    db.refresh(new_order)
+    return {"message": "Order sent to kitchen", "order": new_order}
+
+@app.post("/api/stations/release")
+def release_station(req: ReleaseStationRequest, db: Session = Depends(get_db)):
+    """Staff action: end session and free up seat"""
+    if req.pin != "9900":
+        raise HTTPException(status_code=403, detail="Invalid admin PIN")
+    st = db.query(StationModel).filter(StationModel.id == req.station_id).first()
+    if not st:
+        raise HTTPException(status_code=404, detail="Station not found")
+    st.status = "available"
+    st.active_game = None
+    db.commit()
+    return {"message": "Station is now available", "station_id": st.id}
